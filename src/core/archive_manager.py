@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Callable
 from datetime import datetime
 import logging
+from .password_manager import PasswordManager
 
 # 压缩格式处理
 import py7zr
@@ -24,6 +25,7 @@ class ArchiveManager:
     def __init__(self, db_path: str = "archives.db"):
         self.db_path = db_path
         self.logger = logging.getLogger(__name__)
+        self.password_manager = PasswordManager()
         
         # 支持的压缩格式及其处理器
         self.supported_formats = {
@@ -237,10 +239,11 @@ class ArchiveManager:
             self.logger.error(f"搜索压缩包失败: {e}")
             return []
     
-    def extract_archive(self, archive_path: str, output_path: str, 
+    def extract_archive(self, archive_path: str, output_path: str,
                        selected_files: Optional[List[str]] = None,
-                       progress_callback: Optional[Callable] = None) -> bool:
-        """解压缩文件"""
+                       progress_callback: Optional[Callable] = None,
+                       password: Optional[str] = None) -> Dict[str, any]:
+        """解压缩文件 - 增强版本，支持密码检测和处理"""
         try:
             path = Path(archive_path)
             if not path.exists():
@@ -256,13 +259,46 @@ class ArchiveManager:
             if not handler:
                 raise ValueError(f"不支持的格式: {suffix}")
             
-            return handler('extract', str(path), str(output_dir), selected_files, progress_callback)
+            # 首先尝试无密码解压
+            if password is None:
+                try:
+                    success = handler('extract', str(path), str(output_dir), selected_files, progress_callback)
+                    if success:
+                        return {'success': True, 'password_required': False}
+                except Exception:
+                    # 检查是否需要密码
+                    if self.password_manager.check_password_required(str(path)):
+                        return {'success': False, 'password_required': True, 'error': '需要密码'}
+                    else:
+                        raise
+            else:
+                # 使用提供的密码解压
+                success = self.password_manager.extract_with_password(str(path), str(output_dir), password)
+                return {'success': success, 'password_required': True, 'password_correct': success}
             
         except Exception as e:
             self.logger.error(f"解压失败: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def create_archive_with_password(self, files: List[str], archive_path: str,
+                                   format_type: str = '7z', password: Optional[str] = None,
+                                   progress_callback: Optional[Callable] = None) -> bool:
+        """创建压缩包（支持密码保护）"""
+        try:
+            if password:
+                return self.password_manager.create_password_archive(files, archive_path, password, format_type)
+            else:
+                return self.create_archive(files, archive_path, format_type, progress_callback)
+        except Exception as e:
+            self.logger.error(f"创建压缩包失败: {e}")
             return False
     
-    def create_archive(self, files: List[str], archive_path: str, 
+    def crack_archive_password(self, archive_path: str, method: str = 'dictionary',
+                              progress_callback: Optional[Callable] = None) -> Optional[str]:
+        """破解压缩包密码"""
+        return self.password_manager.crack_password(archive_path, method, progress_callback=progress_callback)
+    
+    def create_archive(self, files: List[str], archive_path: str,
                       format_type: str = '7z',
                       progress_callback: Optional[Callable] = None) -> bool:
         """创建压缩包"""

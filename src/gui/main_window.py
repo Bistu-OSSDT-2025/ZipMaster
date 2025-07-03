@@ -8,10 +8,13 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 import logging
+import os  # 添加这行
 from pathlib import Path
 
 from core.archive_manager import ArchiveManager
 from utils.helpers import format_size, format_datetime
+
+from .password_dialogs import PasswordInputDialog, PasswordCrackDialog, CreatePasswordArchiveDialog, ExtractOptionsDialog
 
 class MainWindow:
     """主窗口类"""
@@ -50,9 +53,12 @@ class MainWindow:
         # 工具栏
         self.toolbar = ttk.Frame(self.root)
         
+        # 工具栏 - 添加密码相关按钮
         ttk.Button(self.toolbar, text="📁 扫描目录", command=self.scan_directory).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.toolbar, text="📦 解压选中", command=self.extract_selected).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.toolbar, text="🗜️ 创建压缩包", command=self.create_archive).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.toolbar, text="🔒 带密码压缩", command=self.create_password_archive).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.toolbar, text="🔓 密码破解", command=self.crack_password).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.toolbar, text="🔍 查看详情", command=self.view_details).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.toolbar, text="🔄 刷新", command=self.refresh_list).pack(side=tk.LEFT, padx=5)
         
@@ -163,48 +169,42 @@ class MainWindow:
         self.tree.bind('<Button-3>', self._show_context_menu)
     
     def _load_archives(self):
-        """加载现有压缩包数据"""
+        """加载现有压缩包数据 - 修复版本"""
         try:
-            archives = self.archive_manager.get_all_archives()
-            self._populate_tree(archives)
-            self.status_var.set(f"加载了 {len(archives)} 个压缩包")
+            # 不自动加载所有数据，只显示空列表
+            self._populate_tree([])
+            self.status_var.set("就绪 - 请选择目录进行扫描")
         except Exception as e:
-            self.logger.error(f"加载数据失败: {e}")
-            messagebox.showerror("错误", f"加载数据失败: {e}")
+            self.logger.error(f"初始化失败: {e}")
+            messagebox.showerror("错误", f"初始化失败: {e}")
     
-    def _populate_tree(self, archives):
-        """填充文件列表"""
-        # 清空现有项目
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        
-        # 添加新项目
-        for archive in archives:
-            self.tree.insert('', tk.END, values=(
-                archive['name'],
-                archive['path'],
-                format_size(archive['size']),
-                archive['type'].upper(),
-                archive.get('file_count', 0),
-                format_datetime(archive['modified'])
-            ))
+    def refresh_list(self):
+        """刷新列表 - 只刷新当前扫描的目录"""
+        if hasattr(self, 'last_scanned_directory') and self.last_scanned_directory:
+            self.scan_directory_path(self.last_scanned_directory)
+        else:
+            messagebox.showinfo("提示", "请先扫描一个目录")
     
     def scan_directory(self):
-        """扫描目录"""
+        """扫描目录 - 增强版本"""
         directory = filedialog.askdirectory(title="选择要扫描的目录")
         if not directory:
             return
         
+        self.last_scanned_directory = directory
+        self.scan_directory_path(directory)
+    
+    def scan_directory_path(self, directory):
+        """扫描指定路径"""
         # 在后台线程中执行扫描
         def scan_worker():
             try:
-                self.status_var.set("正在扫描...")
-                self.progress_var.set(0)
+                self.root.after(0, lambda: self.status_var.set(f"正在扫描 {directory}..."))
+                self.root.after(0, lambda: self.progress_var.set(0))
                 
                 def progress_callback(current, total):
                     progress = (current / total) * 100 if total > 0 else 0
-                    self.progress_var.set(progress)
-                    self.root.update_idletasks()
+                    self.root.after(0, lambda p=progress: self.progress_var.set(p))
                 
                 archives = self.archive_manager.scan_directory(directory, progress_callback)
                 
@@ -229,17 +229,22 @@ class MainWindow:
         self.progress_var.set(0)
     
     def extract_selected(self):
-        """解压选中的文件"""
+        """解压选中的文件 - 增强版本，支持同名文件夹选项"""
         selection = self.tree.selection()
         if not selection:
             messagebox.showwarning("警告", "请先选择要解压的文件")
             return
         
-        output_dir = filedialog.askdirectory(title="选择解压目录")
-        if not output_dir:
+        # 询问解压选项
+        extract_dialog = ExtractOptionsDialog(self.root)
+        options = extract_dialog.show()
+        
+        if not options:
             return
         
-        # 在后台线程中执行解压
+        output_base_dir = options['output_dir']
+        create_subfolder = options['create_subfolder']
+        
         def extract_worker():
             success_count = 0
             total_count = len(selection)
@@ -250,12 +255,26 @@ class MainWindow:
                     archive_path = values[1]
                     archive_name = values[0]
                     
+                    # 确定输出目录
+                    if create_subfolder:
+                        # 创建与压缩包同名的文件夹
+                        archive_basename = Path(archive_name).stem
+                        output_dir = os.path.join(output_base_dir, archive_basename)
+                    else:
+                        output_dir = output_base_dir
+                    
                     self.root.after(0, lambda name=archive_name: 
                                   self.status_var.set(f"正在解压 {name}..."))
                     
-                    success = self.archive_manager.extract_archive(archive_path, output_dir)
-                    if success:
+                    # 尝试解压
+                    result = self.archive_manager.extract_archive(archive_path, output_dir)
+                    
+                    if result['success']:
                         success_count += 1
+                    elif result.get('password_required'):
+                        # 需要密码，在主线程中处理
+                        self.root.after(0, lambda path=archive_path, output=output_dir: 
+                                       self._handle_password_required(path, output))
                     
                     progress = ((i + 1) / total_count) * 100
                     self.root.after(0, lambda p=progress: self.progress_var.set(p))
@@ -266,6 +285,142 @@ class MainWindow:
             self.root.after(0, lambda: self._on_extract_complete(success_count, total_count))
         
         threading.Thread(target=extract_worker, daemon=True).start()
+    
+    def _handle_password_required(self, archive_path: str, output_dir: str):
+        """处理需要密码的情况"""
+        # 显示密码输入对话框
+        dialog = PasswordInputDialog(self.root, "需要密码", f"文件 {os.path.basename(archive_path)} 需要密码:")
+        password = dialog.show()
+        
+        if password:
+            # 尝试使用密码解压
+            def extract_with_password():
+                try:
+                    result = self.archive_manager.extract_archive(archive_path, output_dir, password=password)
+                    if result['success']:
+                        self.root.after(0, lambda: messagebox.showinfo("成功", "解压成功！"))
+                    else:
+                        self.root.after(0, lambda: messagebox.showerror("失败", "密码错误或解压失败"))
+                except Exception as e:
+                    self.root.after(0, lambda: messagebox.showerror("错误", f"解压失败: {e}"))
+            
+            threading.Thread(target=extract_with_password, daemon=True).start()
+        else:
+            # 用户取消或询问是否尝试破解
+            if messagebox.askyesno("密码破解", "是否尝试破解密码？"):
+                self.crack_password_for_file(archive_path)
+    
+    def _on_extract_complete(self, success_count, total_count):
+        """解压完成回调 - 优化版本"""
+        if success_count == total_count:
+            messagebox.showinfo("成功", f"成功解压 {success_count} 个文件")
+        else:
+            messagebox.showwarning("部分成功", 
+                                 f"成功解压 {success_count}/{total_count} 个文件")
+        
+        self.status_var.set(f"解压完成: {success_count}/{total_count}")
+        self.progress_var.set(0)
+        # 移除自动刷新，保持当前列表状态
+        # self.refresh_list()  # 注释掉这行
+    
+    def create_password_archive(self):
+        """创建带密码的压缩包 - 优化版本"""
+        files = filedialog.askopenfilenames(title="选择要压缩的文件")
+        if not files:
+            return
+        
+        # 显示密码设置对话框
+        dialog = CreatePasswordArchiveDialog(self.root)
+        result = dialog.show()
+        
+        if not result:
+            return
+        
+        password = result['password']
+        format_type = result['format']
+        
+        # 选择保存位置
+        ext = '.zip' if format_type == 'zip' else '.7z'
+        archive_path = filedialog.asksaveasfilename(
+            title="保存压缩包",
+            defaultextension=ext,
+            filetypes=[(f"{format_type.upper()} 文件", f"*{ext}")]
+        )
+        
+        if not archive_path:
+            return
+        
+        def create_worker():
+            try:
+                self.root.after(0, lambda: self.status_var.set("正在创建带密码的压缩包..."))
+                
+                success = self.archive_manager.create_archive_with_password(
+                    list(files), archive_path, format_type, password
+                )
+                
+                if success:
+                    self.root.after(0, lambda: messagebox.showinfo("成功", "带密码的压缩包创建成功！"))
+                    # 只有在当前目录包含新文件时才刷新
+                    if hasattr(self, 'last_scanned_directory') and self.last_scanned_directory:
+                        archive_dir = str(Path(archive_path).parent)
+                        if archive_dir == self.last_scanned_directory or archive_dir.startswith(self.last_scanned_directory):
+                            self.root.after(0, lambda: self.scan_directory_path(self.last_scanned_directory))
+                    else:
+                        self.root.after(0, lambda: self.refresh_list())
+                else:
+                    self.root.after(0, lambda: messagebox.showerror("失败", "创建压缩包失败"))
+                
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"创建失败: {e}"))
+            finally:
+                self.root.after(0, lambda: self.status_var.set("就绪"))
+        
+        threading.Thread(target=create_worker, daemon=True).start()
+    
+    def crack_password(self):
+        """破解选中文件的密码"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("警告", "请先选择要破解密码的文件")
+            return
+        
+        if len(selection) > 1:
+            messagebox.showwarning("警告", "请只选择一个文件进行密码破解")
+            return
+        
+        values = self.tree.item(selection[0])['values']
+        archive_path = values[1]
+        
+        self.crack_password_for_file(archive_path)
+    
+    def crack_password_for_file(self, archive_path: str):
+        """为指定文件破解密码"""
+        def crack_callback(path, method, charset, max_length, progress_callback):
+            return self.archive_manager.crack_archive_password(
+                path, method, progress_callback=progress_callback
+            )
+        
+        dialog = PasswordCrackDialog(self.root, archive_path, crack_callback)
+        result_password = dialog.show()
+        
+        if result_password:
+            # 询问是否立即解压
+            if messagebox.askyesno("解压", f"密码破解成功: {result_password}\n\n是否立即解压文件？"):
+                output_dir = filedialog.askdirectory(title="选择解压目录")
+                if output_dir:
+                    def extract_worker():
+                        try:
+                            result = self.archive_manager.extract_archive(
+                                archive_path, output_dir, password=result_password
+                            )
+                            if result['success']:
+                                self.root.after(0, lambda: messagebox.showinfo("成功", "解压成功！"))
+                            else:
+                                self.root.after(0, lambda: messagebox.showerror("失败", "解压失败"))
+                        except Exception as e:
+                            self.root.after(0, lambda: messagebox.showerror("错误", f"解压失败: {e}"))
+                    
+                    threading.Thread(target=extract_worker, daemon=True).start()
     
     def _on_extract_complete(self, success_count, total_count):
         """解压完成回调"""
@@ -476,3 +631,27 @@ ZipMaster v1.0
             messagebox.showerror("错误", f"应用运行失败: {e}")
         finally:
             self.archive_manager.close()
+
+    def _populate_tree(self, archives):
+        """填充树形列表"""
+        # 清空现有数据
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # 添加新数据
+        for archive in archives:
+            try:
+                # 格式化数据
+                name = Path(archive['path']).name
+                path = archive['path']
+                size = format_size(archive.get('size', 0))
+                file_type = archive.get('type', '').upper()
+                file_count = archive.get('file_count', 0)
+                modified = format_datetime(archive.get('modified', ''))
+                
+                # 插入到树形列表
+                self.tree.insert('', tk.END, values=(
+                    name, path, size, file_type, file_count, modified
+                ))
+            except Exception as e:
+                self.logger.error(f"添加压缩包信息失败: {e}")
