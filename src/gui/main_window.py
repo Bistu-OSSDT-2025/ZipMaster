@@ -34,6 +34,9 @@ class MainWindow:
         self.archive_manager = ArchiveManager()
         self.logger = logging.getLogger(__name__)
         
+        # 排序状态
+        self._current_sort_column = None
+        
         # 创建界面
         self._create_widgets()
         self._setup_layout()
@@ -55,6 +58,25 @@ class MainWindow:
         ttk.Button(self.toolbar, text="🗜️ 创建压缩包", command=self.create_archive).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.toolbar, text="🔍 查看详情", command=self.view_details).pack(side=tk.LEFT, padx=5)
         ttk.Button(self.toolbar, text="🔄 刷新", command=self.refresh_list).pack(side=tk.LEFT, padx=5)
+        
+        # 分隔符
+        ttk.Separator(self.toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        
+        # 排序选择控件
+        ttk.Label(self.toolbar, text="排序:").pack(side=tk.LEFT, padx=5)
+        self.sort_var = tk.StringVar(value="名称")
+        self.sort_combo = ttk.Combobox(self.toolbar, textvariable=self.sort_var, 
+                                       values=["名称", "大小", "修改时间", "类型", "文件数"], 
+                                       width=10, state="readonly")
+        self.sort_combo.pack(side=tk.LEFT, padx=5)
+        self.sort_combo.bind('<<ComboboxSelected>>', self._on_sort_change)
+        
+        # 排序方向
+        self.sort_reverse = tk.BooleanVar()
+        self.sort_direction_btn = ttk.Checkbutton(self.toolbar, text="降序", 
+                                                 variable=self.sort_reverse,
+                                                 command=self._on_sort_change)
+        self.sort_direction_btn.pack(side=tk.LEFT, padx=5)
         
         # 分隔符
         ttk.Separator(self.toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
@@ -188,6 +210,9 @@ class MainWindow:
                 archive.get('file_count', 0),
                 format_datetime(archive['modified'])
             ))
+        
+        # 应用当前排序设置
+        self._apply_current_sort()
     
     def scan_directory(self):
         """扫描目录"""
@@ -407,15 +432,133 @@ class MainWindow:
         """刷新列表"""
         self._load_archives()
     
-    def _sort_column(self, col):
-        """排序列"""
-        # 简单的排序实现
-        items = [(self.tree.set(item, col), item) for item in self.tree.get_children('')]
-        items.sort()
+    def _on_sort_change(self, event=None):
+        """排序方式改变时的回调"""
+        self._apply_current_sort()
+    
+    def _apply_current_sort(self):
+        """应用当前选择的排序方式"""
+        sort_column = self.sort_var.get()
+        reverse = self.sort_reverse.get()
         
-        for index, (val, item) in enumerate(items):
+        # 获取所有项目的数据
+        items_data = []
+        for item in self.tree.get_children(''):
+            values = self.tree.item(item)['values']
+            items_data.append((item, values))
+        
+        # 根据选择的列进行排序
+        column_index = {'名称': 0, '路径': 1, '大小': 2, '类型': 3, '文件数': 4, '修改时间': 5}
+        col_idx = column_index.get(sort_column, 0)
+        
+        def sort_key(item_data):
+            item, values = item_data
+            value = values[col_idx]
+            
+            if sort_column == '大小':
+                # 解析大小字符串为数字进行排序
+                return self._parse_size_for_sort(value)
+            elif sort_column == '文件数':
+                # 文件数按数字排序
+                try:
+                    return int(value)
+                except (ValueError, TypeError):
+                    return 0
+            elif sort_column == '修改时间':
+                # 时间排序
+                return self._parse_datetime_for_sort(value)
+            else:
+                # 字典序排序（名称、路径、类型）
+                return str(value).lower()
+        
+        # 执行排序
+        items_data.sort(key=sort_key, reverse=reverse)
+        
+        # 重新排列树形控件中的项目
+        for index, (item, values) in enumerate(items_data):
             self.tree.move(item, '', index)
     
+    def _parse_size_for_sort(self, size_str):
+        """解析大小字符串为字节数用于排序"""
+        if not size_str or size_str == '-':
+            return 0
+        
+        try:
+            # 移除单位并转换为数字
+            size_str = str(size_str).strip().upper()
+            
+            # 定义单位转换
+            units = {
+                'B': 1,
+                'KB': 1024,
+                'MB': 1024 * 1024,
+                'GB': 1024 * 1024 * 1024,
+                'TB': 1024 * 1024 * 1024 * 1024
+            }
+            
+            # 查找单位
+            for unit, multiplier in units.items():
+                if size_str.endswith(unit):
+                    number_part = size_str[:-len(unit)].strip()
+                    try:
+                        return float(number_part) * multiplier
+                    except ValueError:
+                        return 0
+            
+            # 如果没有单位，假设是字节
+            return float(size_str)
+        except (ValueError, AttributeError):
+            return 0
+    
+    def _parse_datetime_for_sort(self, datetime_str):
+        """解析日期时间字符串用于排序"""
+        if not datetime_str or datetime_str == '-':
+            return datetime.min
+        
+        try:
+            # 尝试解析常见的日期时间格式
+            from datetime import datetime
+            
+            # 常见格式列表
+            formats = [
+                '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%d %H:%M',
+                '%Y-%m-%d',
+                '%Y/%m/%d %H:%M:%S',
+                '%Y/%m/%d %H:%M',
+                '%Y/%m/%d',
+                '%m/%d/%Y %H:%M:%S',
+                '%m/%d/%Y %H:%M',
+                '%m/%d/%Y'
+            ]
+            
+            for fmt in formats:
+                try:
+                    return datetime.strptime(str(datetime_str).strip(), fmt)
+                except ValueError:
+                    continue
+            
+            return datetime.min
+        except Exception:
+            return datetime.min
+    
+    def _sort_column(self, col):
+        """点击列标题时的排序（保持原有功能的同时更新排序选择）"""
+        # 更新排序选择控件
+        self.sort_var.set(col)
+        
+        # 如果点击的是当前排序列，则切换排序方向
+        current_sort = getattr(self, '_current_sort_column', None)
+        if current_sort == col:
+            self.sort_reverse.set(not self.sort_reverse.get())
+        else:
+            self.sort_reverse.set(False)
+        
+        self._current_sort_column = col
+        
+        # 应用排序
+        self._apply_current_sort()
+
     def _show_context_menu(self, event):
         """显示右键菜单"""
         item = self.tree.identify_row(event.y)
