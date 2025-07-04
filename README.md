@@ -26,7 +26,11 @@
 
 ### 安装步骤
 
-1. **克隆项目**
+**直接安装exe文件即可**
+
+
+
+**或克隆项目**
    ```bash
    git clone https://github.com/yourusername/zipmaster.git
    cd zipmaster
